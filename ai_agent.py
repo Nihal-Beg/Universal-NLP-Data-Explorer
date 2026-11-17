@@ -8,6 +8,18 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_PATH = BASE_DIR / "data" / "superstore.csv"
 
 
+def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Drops index artifact columns (like 'Unnamed: 0') and strips whitespace from headers."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    cols_to_drop = [
+        c for c in df.columns if c.lower().startswith("unnamed:") or c == ""
+    ]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+    return df
+
+
 def load_dataset(uploaded_file=None) -> tuple[pd.DataFrame, str]:
     """Loads an uploaded CSV/Excel file or falls back to the built-in Superstore dataset."""
     if uploaded_file is not None:
@@ -20,18 +32,38 @@ def load_dataset(uploaded_file=None) -> tuple[pd.DataFrame, str]:
                 df = pd.read_csv(uploaded_file, encoding="latin1")
         else:
             df = pd.read_excel(uploaded_file)
-        return df, filename
+        return _clean_dataframe(df), filename
 
     df = pd.read_csv(DEFAULT_DATA_PATH, encoding="latin1")
-    return df, "Sample: Superstore Sales (superstore.csv)"
+    return _clean_dataframe(df), "Sample: Superstore Sales (superstore.csv)"
+
+
+def _is_id_or_code_column(col_name: str, series: pd.Series) -> bool:
+    """Identifies ID, postal code, or row-number columns that shouldn't be treated as metrics."""
+    name_lower = col_name.lower()
+    id_keywords = ["id", "postal", "zip", "code", "phone", "row", "index", "sr", "no."]
+    if any(
+        re.search(rf"(^|[^a-z]){kw}([^a-z]|$)", name_lower) for kw in id_keywords
+    ):
+        return True
+    # Also exclude purely sequential integers (e.g., 1, 2, 3, ..., N)
+    if pd.api.types.is_integer_dtype(series) and series.nunique() == len(series):
+        return True
+    return False
 
 
 def detect_column_types(df: pd.DataFrame) -> dict:
-    """Automatically categorizes columns into numeric, categorical, and datetime."""
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    """Automatically categorizes columns into meaningful metrics, categories, and dates."""
+    all_numeric = df.select_dtypes(include=["number"]).columns.tolist()
+    metric_cols = [
+        col for col in all_numeric if not _is_id_or_code_column(col, df[col])
+    ]
+    # Fallback to all numeric if every numeric column looks like an ID
+    if not metric_cols:
+        metric_cols = all_numeric
+
     datetime_cols = df.select_dtypes(include=["datetime64[ns]", "datetime"]).columns.tolist()
 
-    # Attempt to detect date-like string columns
     for col in df.select_dtypes(include=["object", "string"]).columns:
         if any(keyword in col.lower() for keyword in ["date", "time", "year", "month"]):
             parsed = pd.to_datetime(df[col], errors="coerce")
@@ -42,18 +74,38 @@ def detect_column_types(df: pd.DataFrame) -> dict:
     categorical_cols = [
         col
         for col in df.columns
-        if col not in numeric_cols and col not in datetime_cols and df[col].nunique() <= 50
+        if col not in all_numeric
+        and col not in datetime_cols
+        and not _is_id_or_code_column(col, df[col])
+        and 1 < df[col].nunique() <= 50
     ]
     all_text_cols = [
-        col for col in df.columns if col not in numeric_cols and col not in datetime_cols
+        col
+        for col in df.columns
+        if col not in all_numeric
+        and col not in datetime_cols
+        and not _is_id_or_code_column(col, df[col])
     ]
 
     return {
-        "numeric": numeric_cols,
+        "numeric": metric_cols,
+        "all_numeric": all_numeric,
         "categorical": categorical_cols,
         "text": all_text_cols,
         "datetime": datetime_cols,
     }
+
+
+def _prioritize_columns(cols: list[str], priority_terms: list[str]) -> list[str]:
+    """Moves high-value business columns (like Sales, Profit, Category) to the front."""
+    def score(col: str) -> int:
+        c = col.lower()
+        for idx, term in enumerate(priority_terms):
+            if term in c:
+                return idx
+        return len(priority_terms)
+
+    return sorted(cols, key=score)
 
 
 def _match_column(query: str, candidates: list[str]) -> str | None:
@@ -69,23 +121,32 @@ def _match_column(query: str, candidates: list[str]) -> str | None:
 
 
 def generate_sample_prompts(col_types: dict) -> list[str]:
-    """Builds dynamic sample queries tailored to whatever dataset is currently loaded."""
-    num_cols = col_types["numeric"]
-    cat_cols = col_types["categorical"] or col_types["text"]
+    """Builds dynamic, business-relevant sample queries tailored to the active dataset."""
+    num_cols = _prioritize_columns(
+        col_types["numeric"],
+        ["sales", "revenue", "profit", "amount", "price", "total", "cost", "quantity"],
+    )
+    cat_cols = _prioritize_columns(
+        col_types["categorical"] or col_types["text"],
+        ["category", "segment", "region", "product", "department", "state", "city", "status", "type"],
+    )
     date_cols = col_types["datetime"]
 
     prompts = ["Show dataset summary", "Show missing values"]
 
     if num_cols and cat_cols:
-        num = num_cols[0]
-        cat = cat_cols[0]
-        prompts.append(f"Total {num} by {cat}")
-        prompts.append(f"{num} by {cat} chart")
-        prompts.append(f"Top 5 {cat} by {num}")
-        prompts.append(f"Lowest {cat} by {num}")
+        primary_num = num_cols[0]
+        primary_cat = cat_cols[0]
+        prompts.append(f"Total {primary_num} by {primary_cat}")
+        prompts.append(f"{primary_num} by {primary_cat} chart")
+        prompts.append(f"Top 5 {primary_cat} by {primary_num}")
+        prompts.append(f"Lowest {primary_cat} by {primary_num}")
 
-    if len(num_cols) > 1 and len(cat_cols) > 1:
-        prompts.append(f"Average {num_cols[1]} by {cat_cols[1]}")
+    if len(num_cols) > 1:
+        second_num = num_cols[1]
+        second_cat = cat_cols[1] if len(cat_cols) > 1 else cat_cols[0]
+        prompts.append(f"Total {second_num} by {second_cat}")
+        prompts.append(f"{second_num} by {second_cat} chart")
 
     if num_cols and date_cols:
         prompts.append(f"{num_cols[0]} trend over time chart")
@@ -101,6 +162,7 @@ def ai_agent(query: str, df: pd.DataFrame):
     df = df.copy()
     col_types = detect_column_types(df)
     num_cols = col_types["numeric"]
+    all_num_cols = col_types["all_numeric"]
     cat_cols = col_types["categorical"] or col_types["text"]
     date_cols = col_types["datetime"]
 
@@ -109,9 +171,10 @@ def ai_agent(query: str, df: pd.DataFrame):
 
     # 1. Dataset summary / statistics
     if any(word in q for word in ["summary", "describe", "overview", "stats", "statistics"]):
-        if not num_cols:
+        target_nums = num_cols or all_num_cols
+        if not target_nums:
             return df.describe(include="all").T.reset_index().rename(columns={"index": "Column"})
-        summary = df[num_cols].describe().T[["count", "mean", "min", "50%", "max"]].round(2).reset_index()
+        summary = df[target_nums].describe().T[["count", "mean", "min", "50%", "max"]].round(2).reset_index()
         summary.columns = ["Column", "Count", "Mean", "Min", "Median", "Max"]
         return summary
 
@@ -125,7 +188,7 @@ def ai_agent(query: str, df: pd.DataFrame):
     # 3. Correlation matrix
     if "correlation" in q or "corr" in q:
         if len(num_cols) < 2:
-            return "At least two numeric columns are needed to compute correlations."
+            return "At least two numeric metric columns are needed to compute correlations."
         corr = df[num_cols].corr().round(2)
         if wants_chart:
             return px.imshow(corr, text_auto=True, title="Numeric Feature Correlation Heatmap")
@@ -155,11 +218,11 @@ def ai_agent(query: str, df: pd.DataFrame):
             )
         return trend
 
-    # 5. Group-by aggregation (Top / Lowest / Average / Total / Count)
+    # 5. Group-by aggregation (Top / Lowest / Average / Total)
     if num_cols and cat_cols:
-        num_col = _match_column(q, num_cols) or num_cols[0]
-        # Prefer category columns matching the query; fall back to first categorical column
-        cat_col = _match_column(q, cat_cols) or cat_cols[0]
+        num_col = _match_column(q, all_num_cols) or num_cols[0]
+        all_group_candidates = list(dict.fromkeys(cat_cols + col_types["text"]))
+        cat_col = _match_column(q, all_group_candidates) or cat_cols[0]
 
         agg_func = "mean" if any(w in q for w in ["average", "avg", "mean"]) else "sum"
         agg_label = "Average" if agg_func == "mean" else "Total"
@@ -173,7 +236,6 @@ def ai_agent(query: str, df: pd.DataFrame):
         metric_col = f"{agg_label} {num_col}"
         grouped.columns = [cat_col, metric_col]
 
-        # Extract top/bottom N if specified (e.g., "top 5", "bottom 3", "least")
         top_match = re.search(r"(top|bottom|lowest|least)\s*(\d+)?", q)
         if top_match:
             direction = top_match.group(1)
@@ -203,7 +265,7 @@ def ai_agent(query: str, df: pd.DataFrame):
 
         return grouped
 
-    # 6. Fallback for categorical-only datasets (value counts)
+    # 6. Fallback for categorical-only datasets
     if cat_cols:
         cat_col = _match_column(q, cat_cols) or cat_cols[0]
         counts = df[cat_col].value_counts().reset_index()
