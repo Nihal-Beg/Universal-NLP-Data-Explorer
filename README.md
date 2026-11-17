@@ -2,6 +2,8 @@
 
 An interactive natural-language data analysis dashboard built with **Python**, **Streamlit**, **Pandas**, and **Plotly**. Users can query the Superstore retail dataset in plain English to generate formatted summary tables and interactive visualizations without writing SQL or spreadsheet formulas.
 
+🚀 **[Try the Live App on Streamlit Cloud](https://nlp-sales-data-assistant.streamlit.app/#nlp-sales-data-assistant)**
+
 ## ✨ Features
 - **Natural Language Querying:** Uses fuzzy string matching (`fuzzywuzzy`) to map user questions to analytical functions.
 - **Interactive Visualizations:** Generates dynamic Plotly bar and donut charts for yearly, regional, and category sales.
@@ -23,7 +25,7 @@ nlp-sales-assistant/
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-username/nlp-sales-assistant.git
+   git clone https://github.com/Nihal-Beg/nlp-sales-assistant.git
    cd nlp-sales-assistant
    ```
 
